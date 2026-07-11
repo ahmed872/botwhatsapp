@@ -1,0 +1,10 @@
+node_modules/
+.wwebjs_auth/
+.wwebjs_cache/
+src/data/media/
+src/data/customers.json
+src/data/requests.json
+src/data/meta.json
+.env
+npm-debug.log*
+.DS_Store
