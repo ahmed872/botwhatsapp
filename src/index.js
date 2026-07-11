@@ -1,190 +1,225 @@
 /**
- * نقطة تشغيل بوت الواتساب.
- * يعتمد على whatsapp-web.js (يعمل بمسح كود QR مرة واحدة).
+ * نقطة تشغيل بوت الواتساب عبر WhatsApp Cloud API الرسمي من ميتا.
  *
- * التشغيل:  npm start
- * أول مرة: امسح كود QR الظاهر في الطرفية من واتساب على جوالك
- *          (الإعدادات → الأجهزة المرتبطة → ربط جهاز).
+ * كيف يعمل:
+ *   - ميتا ترسل رسائل العملاء الواردة إلى POST /webhook (ويب هوك).
+ *   - البوت يمررها لمحرك المحادثة (flow.js) ويرسل الردود عبر Graph API.
+ *
+ * الإعداد المطلوب في ملف .env (انظر .env.example):
+ *   WHATSAPP_TOKEN   : توكن الوصول من لوحة ميتا
+ *   PHONE_NUMBER_ID  : معرّف رقم الواتساب (وليس الرقم نفسه)
+ *   VERIFY_TOKEN     : كلمة سر تختارها أنت وتكتبها في إعداد الويب هوك بلوحة ميتا
+ *   EMPLOYEE_NUMBER  : (اختياري) رقم واتساب الموظف لإشعارات الطلبات، مثال 9665XXXXXXXX
+ *
+ * التشغيل: npm start
  */
 
 const fs = require('fs');
 const path = require('path');
-const { Client, LocalAuth } = require('whatsapp-web.js');
-const qrcode = require('qrcode-terminal');
+const express = require('express');
 
 const flow = require('./bot/flow');
 
-// رقم واتساب الموظف لاستقبال إشعارات الطلبات الجديدة (اختياري).
-// اضبطه في متغير البيئة EMPLOYEE_NUMBER بصيغة الدولة، مثال: 9665XXXXXXXX
-const EMPLOYEE_NUMBER = process.env.EMPLOYEE_NUMBER || '';
+const {
+  WHATSAPP_TOKEN,
+  PHONE_NUMBER_ID,
+  VERIFY_TOKEN = 'eservices-bot',
+  EMPLOYEE_NUMBER = '',
+  GRAPH_API_VERSION = 'v23.0',
+  PORT = 3000,
+} = process.env;
+
+if (!WHATSAPP_TOKEN || !PHONE_NUMBER_ID) {
+  console.error(
+    '❌ يجب ضبط WHATSAPP_TOKEN و PHONE_NUMBER_ID.\n' +
+      'انسخ .env.example إلى .env واملأ القيم من لوحة ميتا (خطوات الإعداد في README).'
+  );
+  process.exit(1);
+}
+
+const GRAPH_URL = `https://graph.facebook.com/${GRAPH_API_VERSION}`;
 
 // مجلد حفظ المستندات المرسلة
 const MEDIA_DIR = path.join(__dirname, 'data', 'media');
 if (!fs.existsSync(MEDIA_DIR)) fs.mkdirSync(MEDIA_DIR, { recursive: true });
 
-const client = new Client({
-  authStrategy: new LocalAuth({ dataPath: path.join(__dirname, '..', '.wwebjs_auth') }),
-  puppeteer: {
-    headless: true,
-    // لاستخدام متصفح Chrome المثبت على الجهاز بدل المتصفح المرفق،
-    // اضبط متغير البيئة CHROME_PATH بمسار chrome.exe
-    executablePath: process.env.CHROME_PATH || undefined,
-    args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',
-      '--disable-gpu',
-    ],
-  },
-});
+/* ------------------------- الإرسال عبر Graph API ------------------------- */
 
-client.on('qr', (qr) => {
-  console.log('\n📱 امسح كود QR التالي من واتساب (الأجهزة المرتبطة):\n');
-  qrcode.generate(qr, { small: true });
-});
-
-client.on('authenticated', () => {
-  console.log('✅ تم التوثيق بنجاح.');
-});
-
-client.on('ready', () => {
-  console.log('🚀 البوت جاهز ويعمل الآن. في انتظار رسائل العملاء...');
-});
-
-client.on('auth_failure', (msg) => {
-  console.error('❌ فشل التوثيق:', msg);
-});
-
-client.on('disconnected', async (reason) => {
-  console.warn('⚠️ تم قطع الاتصال:', reason);
-  if (reason === 'LOGOUT') {
-    console.warn(
-      'تم تسجيل خروج الجلسة من واتساب. سيُعاد التشغيل وقد يظهر كود QR جديد لمسحه.'
-    );
-  }
-  console.log('🔄 إعادة الاتصال خلال 10 ثوانٍ...');
-  try {
-    await client.destroy();
-  } catch (_) {
-    /* المتصفح قد يكون مغلقاً بالفعل */
-  }
-  setTimeout(() => startWithRetry(), 10000);
-});
-
-// أخطاء داخلية في مكتبة واتساب (أثناء إعادة تحميل الصفحة مثلاً) يجب ألا تُسقط البوت
-process.on('unhandledRejection', (err) => {
-  console.error('⚠️ خطأ غير معالج (تم تجاوزه):', err && err.message ? err.message : err);
-});
-process.on('uncaughtException', (err) => {
-  console.error('⚠️ خطأ غير متوقع (تم تجاوزه):', err && err.message ? err.message : err);
-});
-
-/**
- * حفظ وسائط الرسالة على القرص وإرجاع اسم الملف، أو null عند الفشل.
- */
-async function saveMedia(message) {
-  try {
-    const media = await message.downloadMedia();
-    if (!media || !media.data) return null;
-    const ext = (media.mimetype && media.mimetype.split('/')[1]) || 'bin';
-    const safeExt = ext.split(';')[0];
-    const fileName = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}.${safeExt}`;
-    fs.writeFileSync(path.join(MEDIA_DIR, fileName), media.data, 'base64');
-    return fileName;
-  } catch (err) {
-    console.error('تعذّر حفظ الوسائط:', err.message);
-    return null;
+async function sendText(to, text) {
+  const res = await fetch(`${GRAPH_URL}/${PHONE_NUMBER_ID}/messages`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${WHATSAPP_TOKEN}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      messaging_product: 'whatsapp',
+      to,
+      type: 'text',
+      text: { body: text },
+    }),
+  });
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`فشل إرسال الرسالة (${res.status}): ${body}`);
   }
 }
 
 /**
  * إشعار الموظف بطلب جديد (إن تم ضبط رقمه).
+ * ملاحظة: واتساب يسمح بالرسائل الحرة للموظف فقط خلال 24 ساعة من آخر رسالة
+ * أرسلها الموظف لرقم البوت — انظر README لتفاصيل فتح النافذة.
  */
 async function notifyEmployee(request) {
   if (!EMPLOYEE_NUMBER) return;
-  const clientNumber = (request.chatId || '').replace('@c.us', '');
   const lines = [
     '🔔 *طلب جديد*',
     '',
     `🔖 ${request.id}`,
     `📄 الخدمة: ${request.serviceName}`,
     `💰 السعر: ${typeof request.price === 'number' ? request.price + ' ريال' : request.price}`,
-    `📱 رقم واتساب العميل: ${clientNumber}`,
+    `📱 رقم واتساب العميل: ${request.chatId}`,
     `📎 عدد المستندات المرفقة: ${request.documentsCount || 0}`,
   ];
   try {
-    const jid = `${EMPLOYEE_NUMBER}@c.us`;
-    await client.sendMessage(jid, lines.join('\n'));
+    await sendText(EMPLOYEE_NUMBER, lines.join('\n'));
   } catch (err) {
-    console.error('تعذّر إشعار الموظف:', err.message);
+    console.error(
+      'تعذّر إشعار الموظف (قد تكون نافذة الـ 24 ساعة مغلقة — أرسل أي رسالة من رقم الموظف لرقم البوت لفتحها):',
+      err.message
+    );
   }
 }
 
-// قنوات يستخدمها محرك المحادثة للتأكيد التلقائي بعد آخر مستند
-flow.registerSender((chatId, text) => client.sendMessage(chatId, text));
-flow.registerNotifier(notifyEmployee);
+/* ------------------------- استقبال الوسائط ------------------------- */
 
-client.on('message', async (message) => {
-  try {
-    // تجاهل رسائل المجموعات ورسائل النظام
-    if (message.from.endsWith('@g.us') || message.isStatus) return;
+const MEDIA_TYPES = ['image', 'document', 'video', 'audio', 'sticker'];
 
-    const chatId = message.from;
-
-    // حفظ الوسائط إن وجدت
-    let mediaSaved = null;
-    if (message.hasMedia) {
-      mediaSaved = await saveMedia(message);
+/** استخراج معلومات الوسائط من رسالة واردة إن وجدت */
+function extractMedia(msg) {
+  for (const type of MEDIA_TYPES) {
+    if (msg[type] && msg[type].id) {
+      return {
+        id: msg[type].id,
+        filename: msg[type].filename || null,
+        caption: msg[type].caption || '',
+      };
     }
+  }
+  return null;
+}
 
-    const replies = flow.handleMessage(chatId, {
-      text: message.body || '',
-      hasMedia: message.hasMedia,
-      mediaSaved,
+/** تحميل وسائط من ميتا وحفظها على القرص. يُرجع اسم الملف أو null. */
+async function downloadMedia(media) {
+  try {
+    const metaRes = await fetch(`${GRAPH_URL}/${media.id}`, {
+      headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}` },
     });
+    if (!metaRes.ok) throw new Error(`meta ${metaRes.status}`);
+    const info = await metaRes.json();
 
-    for (const reply of replies) {
-      if (reply && reply.trim()) {
-        await client.sendMessage(chatId, reply);
+    const fileRes = await fetch(info.url, {
+      headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}` },
+    });
+    if (!fileRes.ok) throw new Error(`download ${fileRes.status}`);
+    const buffer = Buffer.from(await fileRes.arrayBuffer());
+
+    const ext = media.filename
+      ? path.extname(media.filename)
+      : '.' + (((info.mime_type || '').split('/')[1] || 'bin').split(';')[0]);
+    const fileName = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}${ext}`;
+    fs.writeFileSync(path.join(MEDIA_DIR, fileName), buffer);
+    return fileName;
+  } catch (err) {
+    console.error('تعذّر تحميل الوسائط:', err.message);
+    return null;
+  }
+}
+
+/* ------------------------- معالجة الرسائل الواردة ------------------------- */
+
+// ميتا قد تعيد إرسال نفس الويب هوك أكثر من مرة — نتجاهل الرسائل المكررة
+const processedIds = new Set();
+
+async function handleIncoming(msg) {
+  if (!msg.id || processedIds.has(msg.id)) return;
+  processedIds.add(msg.id);
+  if (processedIds.size > 5000) processedIds.clear();
+
+  const chatId = msg.from;
+
+  // رسائل الموظف لا تدخل تدفق العملاء (حتى لا يرد عليه البوت بالقوائم)
+  if (EMPLOYEE_NUMBER && chatId === EMPLOYEE_NUMBER) return;
+
+  let text = (msg.text && msg.text.body) || '';
+  let hasMedia = false;
+  let mediaSaved = null;
+
+  const media = extractMedia(msg);
+  if (media) {
+    hasMedia = true;
+    mediaSaved = await downloadMedia(media);
+    if (!text) text = media.caption;
+  }
+
+  const replies = flow.handleMessage(chatId, { text, hasMedia, mediaSaved });
+  for (const reply of replies) {
+    if (reply && reply.trim()) {
+      await sendText(chatId, reply);
+    }
+  }
+}
+
+/* ------------------------- سيرفر الويب هوك ------------------------- */
+
+const app = express();
+app.use(express.json());
+
+// صفحة فحص بسيطة
+app.get('/', (req, res) => {
+  res.send('🤖 eServices WhatsApp Bot is running');
+});
+
+// تحقق ميتا من الويب هوك (يحدث مرة واحدة عند ضبط الرابط في اللوحة)
+app.get('/webhook', (req, res) => {
+  const mode = req.query['hub.mode'];
+  const token = req.query['hub.verify_token'];
+  const challenge = req.query['hub.challenge'];
+  if (mode === 'subscribe' && token === VERIFY_TOKEN) {
+    console.log('✅ تم التحقق من الويب هوك بنجاح.');
+    return res.status(200).send(challenge);
+  }
+  return res.sendStatus(403);
+});
+
+// استقبال الرسائل من ميتا
+app.post('/webhook', (req, res) => {
+  // الرد فوراً حتى لا تعيد ميتا الإرسال، ثم المعالجة في الخلفية
+  res.sendStatus(200);
+
+  const entries = (req.body && req.body.entry) || [];
+  for (const entry of entries) {
+    for (const change of entry.changes || []) {
+      const value = change.value || {};
+      if (value.messaging_product !== 'whatsapp') continue;
+      for (const msg of value.messages || []) {
+        handleIncoming(msg).catch((err) =>
+          console.error('خطأ أثناء معالجة الرسالة:', err)
+        );
       }
     }
-  } catch (err) {
-    console.error('خطأ أثناء معالجة الرسالة:', err);
   }
 });
 
-/**
- * تشغيل البوت مع إعادة المحاولة تلقائياً.
- * خطأ "Execution context was destroyed" وأمثاله كثيراً ما يكون مؤقتاً
- * (إعادة تحميل صفحة واتساب ويب أثناء التشغيل) وينجح في المحاولة التالية.
- */
-const MAX_INIT_ATTEMPTS = 3;
+// قنوات يستخدمها محرك المحادثة للتأكيد التلقائي بعد آخر مستند
+flow.registerSender(sendText);
+flow.registerNotifier(notifyEmployee);
 
-async function startWithRetry(attempt = 1) {
-  try {
-    await client.initialize();
-  } catch (err) {
-    console.error(`\n❌ فشل التشغيل (محاولة ${attempt}/${MAX_INIT_ATTEMPTS}):`, err.message);
-    try {
-      await client.destroy();
-    } catch (_) {
-      /* المتصفح قد يكون مغلقاً بالفعل */
-    }
-    if (attempt >= MAX_INIT_ATTEMPTS) {
-      console.error(
-        [
-          '',
-          'توقف البوت بعد عدة محاولات. جرّب الآتي بالترتيب:',
-          '1. احذف مجلدي .wwebjs_auth و .wwebjs_cache ثم شغّل npm start وامسح QR من جديد.',
-          '2. حدّث المكتبة: npm install whatsapp-web.js@latest',
-          '3. تأكد من اتصال الإنترنت وأن الجهاز لا يمنع تشغيل المتصفح.',
-        ].join('\n')
-      );
-      process.exit(1);
-    }
-    console.log('🔄 إعادة المحاولة خلال 5 ثوانٍ...');
-    setTimeout(() => startWithRetry(attempt + 1), 5000);
-  }
-}
+process.on('unhandledRejection', (err) => {
+  console.error('⚠️ خطأ غير معالج (تم تجاوزه):', err && err.message ? err.message : err);
+});
 
-startWithRetry();
+app.listen(Number(PORT), () => {
+  console.log(`🚀 البوت جاهز ويعمل الآن على المنفذ ${PORT}. في انتظار رسائل العملاء...`);
+  console.log(`   رابط الويب هوك: http://localhost:${PORT}/webhook`);
+});
