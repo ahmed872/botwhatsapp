@@ -26,6 +26,9 @@ const client = new Client({
   authStrategy: new LocalAuth({ dataPath: path.join(__dirname, '..', '.wwebjs_auth') }),
   puppeteer: {
     headless: true,
+    // لاستخدام متصفح Chrome المثبت على الجهاز بدل المتصفح المرفق،
+    // اضبط متغير البيئة CHROME_PATH بمسار chrome.exe
+    executablePath: process.env.CHROME_PATH || undefined,
     args: [
       '--no-sandbox',
       '--disable-setuid-sandbox',
@@ -130,4 +133,38 @@ client.on('message', async (message) => {
   }
 });
 
-client.initialize();
+/**
+ * تشغيل البوت مع إعادة المحاولة تلقائياً.
+ * خطأ "Execution context was destroyed" وأمثاله كثيراً ما يكون مؤقتاً
+ * (إعادة تحميل صفحة واتساب ويب أثناء التشغيل) وينجح في المحاولة التالية.
+ */
+const MAX_INIT_ATTEMPTS = 3;
+
+async function startWithRetry(attempt = 1) {
+  try {
+    await client.initialize();
+  } catch (err) {
+    console.error(`\n❌ فشل التشغيل (محاولة ${attempt}/${MAX_INIT_ATTEMPTS}):`, err.message);
+    try {
+      await client.destroy();
+    } catch (_) {
+      /* المتصفح قد يكون مغلقاً بالفعل */
+    }
+    if (attempt >= MAX_INIT_ATTEMPTS) {
+      console.error(
+        [
+          '',
+          'توقف البوت بعد عدة محاولات. جرّب الآتي بالترتيب:',
+          '1. احذف مجلدي .wwebjs_auth و .wwebjs_cache ثم شغّل npm start وامسح QR من جديد.',
+          '2. حدّث المكتبة: npm install whatsapp-web.js@latest',
+          '3. تأكد من اتصال الإنترنت وأن الجهاز لا يمنع تشغيل المتصفح.',
+        ].join('\n')
+      );
+      process.exit(1);
+    }
+    console.log('🔄 إعادة المحاولة خلال 5 ثوانٍ...');
+    setTimeout(() => startWithRetry(attempt + 1), 5000);
+  }
+}
+
+startWithRetry();
