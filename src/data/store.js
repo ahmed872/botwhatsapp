@@ -1,6 +1,6 @@
 /**
  * طبقة تخزين بسيطة تعتمد على ملفات JSON.
- * تحفظ العملاء والطلبات في مجلد data/.
+ * تحفظ الطلبات في مجلد data/.
  *
  * ملاحظة: مناسبة لحجم صغير (عشرات الطلبات يومياً). لو كبر الحجم
  * يمكن استبدالها بقاعدة بيانات (SQLite/Mongo) دون تغيير باقي الكود.
@@ -10,7 +10,6 @@ const fs = require('fs');
 const path = require('path');
 
 const DATA_DIR = path.join(__dirname);
-const CUSTOMERS_FILE = path.join(DATA_DIR, 'customers.json');
 const REQUESTS_FILE = path.join(DATA_DIR, 'requests.json');
 
 function readJson(file, fallback) {
@@ -30,26 +29,6 @@ function writeJson(file, data) {
   } catch (err) {
     console.error(`خطأ في كتابة ${file}:`, err.message);
   }
-}
-
-/* ----------------------------- العملاء ----------------------------- */
-
-/** حفظ/تحديث بيانات عميل. المفتاح هو رقم الواتساب (chatId). */
-function saveCustomer(chatId, data) {
-  const customers = readJson(CUSTOMERS_FILE, {});
-  customers[chatId] = {
-    ...(customers[chatId] || {}),
-    ...data,
-    chatId,
-    updatedAt: new Date().toISOString(),
-  };
-  writeJson(CUSTOMERS_FILE, customers);
-  return customers[chatId];
-}
-
-function getCustomer(chatId) {
-  const customers = readJson(CUSTOMERS_FILE, {});
-  return customers[chatId] || null;
 }
 
 /* ----------------------------- الطلبات ----------------------------- */
@@ -82,16 +61,39 @@ function getRequest(requestId) {
   return requests[requestId.trim().toUpperCase()] || null;
 }
 
-/** إرجاع كل طلبات عميل معيّن */
+/** إرجاع كل طلبات عميل معيّن مرتبة من الأقدم للأحدث */
 function getRequestsByChat(chatId) {
   const requests = readJson(REQUESTS_FILE, {});
-  return Object.values(requests).filter((r) => r.chatId === chatId);
+  return Object.values(requests)
+    .filter((r) => r.chatId === chatId)
+    .sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt));
+}
+
+/**
+ * إضافة مستند لأحدث طلب للعميل إن كان أُنشئ خلال المدة المحددة.
+ * يُرجع الطلب بعد التحديث، أو null إن لم يوجد طلب حديث.
+ */
+function appendDocumentToLatest(chatId, doc, maxAgeMs) {
+  const requests = readJson(REQUESTS_FILE, {});
+  const mine = Object.values(requests)
+    .filter((r) => r.chatId === chatId)
+    .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+
+  const latest = mine[0];
+  if (!latest) return null;
+  if (Date.now() - new Date(latest.createdAt).getTime() > maxAgeMs) return null;
+
+  latest.documents = latest.documents || [];
+  latest.documents.push(doc);
+  latest.documentsCount = latest.documents.length;
+  requests[latest.id] = latest;
+  writeJson(REQUESTS_FILE, requests);
+  return latest;
 }
 
 module.exports = {
-  saveCustomer,
-  getCustomer,
   createRequest,
   getRequest,
   getRequestsByChat,
+  appendDocumentToLatest,
 };

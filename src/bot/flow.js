@@ -2,15 +2,40 @@
  * محرك المحادثة.
  * يستقبل رسالة العميل ويقرر الرد المناسب حسب حالته الحالية.
  *
+ * التدفق: قائمة رئيسية → قائمة القسم → عرض المستندات المطلوبة
+ *         → استقبال المستندات → تأكيد تلقائي (سيتم التواصل خلال 24 ساعة).
+ *
  * دالة handleMessage تُرجع مصفوفة من الردود (نصوص) يرسلها index.js بالترتيب.
+ * التأكيد التلقائي بعد آخر مستند يُرسل عبر sendFn المسجَّلة من index.js.
  */
 
 const { sections, findServiceById } = require('../config/services');
 const messages = require('../config/messages');
 const store = require('../data/store');
-const { getSession, setSession, resetFlow } = require('./stateManager');
+const { getSession, resetFlow } = require('./stateManager');
 
 const SECTION_ORDER = ['business', 'citizens', 'workers'];
+
+// بعد آخر مستند بهذه المدة يُعتبر الطلب مكتملاً ويُرسل التأكيد تلقائياً
+const FINALIZE_DELAY_MS = 30 * 1000;
+
+// المستند المرسل بعد اكتمال الطلب يُضاف للطلب الأخير خلال هذه المدة
+const LATE_DOCUMENT_WINDOW_MS = 60 * 60 * 1000;
+
+/* --------------------- قنوات الإرسال (من index.js) --------------------- */
+
+let sendFn = async () => {};
+let notifyFn = async () => {};
+
+/** تسجيل دالة إرسال رسالة للعميل (chatId, text) */
+function registerSender(fn) {
+  sendFn = fn;
+}
+
+/** تسجيل دالة إشعار الموظف بطلب جديد (request) */
+function registerNotifier(fn) {
+  notifyFn = fn;
+}
 
 /* ------------------------- أدوات مساعدة ------------------------- */
 
@@ -20,10 +45,6 @@ function normalize(text) {
   return (text || '')
     .replace(/[٠-٩]/g, (d) => arabicDigits.indexOf(d).toString())
     .trim();
-}
-
-function formatPrice(price) {
-  return typeof price === 'number' ? `${price} ريال` : price;
 }
 
 function buildMainMenu() {
@@ -39,79 +60,59 @@ function buildSectionMenu(sectionId) {
     '',
   ];
   section.services.forEach((svc, i) => {
-    lines.push(`${i + 1}. ${svc.name} — ${formatPrice(svc.price)}`);
+    lines.push(`${i + 1}. ${svc.name}`);
   });
   lines.push('');
   lines.push('اكتب *0* للرجوع للقائمة الرئيسية.');
   return lines.join('\n');
 }
 
-function buildServiceIntro(service) {
-  const lines = [
-    `📄 *${service.name}*`,
-    `💰 السعر: ${formatPrice(service.price)}`,
-  ];
-  if (service.time) lines.push(`⏱️ المدة: ${service.time}`);
-  return lines.join('\n');
-}
-
-/* ------------------------- بدء الخدمة ------------------------- */
-
-function startService(chatId, service, section) {
-  const session = getSession(chatId);
-  session.sectionId = section.id;
-  session.serviceId = service.id;
-  session.questionIndex = 0;
-  session.answers = [];
-  session.documents = [];
-
-  const replies = [buildServiceIntro(service)];
-
-  if (service.questions && service.questions.length > 0) {
-    session.step = 'service_questions';
-    replies.push(`❓ ${service.questions[0]}`);
-  } else {
-    session.step = 'service_documents';
-    replies.push(buildDocumentsMessage(service));
-  }
-  return replies;
-}
-
 function buildDocumentsMessage(service) {
-  const lines = [messages.askDocumentsIntro, ''];
+  const lines = [`📄 *${service.name}*`, '', messages.askDocumentsIntro, ''];
   service.documents.forEach((d, i) => lines.push(`${i + 1}. ${d}`));
   lines.push('');
   lines.push(messages.sendDocumentsPrompt);
   return lines.join('\n');
 }
 
-/* ------------------------- إتمام الطلب ------------------------- */
+/* --------------------- إتمام الطلب والتأكيد التلقائي --------------------- */
 
+const finalizeTimers = new Map();
+
+function cancelFinalizeTimer(chatId) {
+  const timer = finalizeTimers.get(chatId);
+  if (timer) {
+    clearTimeout(timer);
+    finalizeTimers.delete(chatId);
+  }
+}
+
+/** جدولة إغلاق الطلب تلقائياً بعد فترة صمت من آخر مستند */
+function scheduleFinalize(chatId) {
+  cancelFinalizeTimer(chatId);
+  finalizeTimers.set(
+    chatId,
+    setTimeout(() => {
+      finalizeTimers.delete(chatId);
+      finalizeAndConfirm(chatId).catch((err) =>
+        console.error('خطأ أثناء تأكيد الطلب:', err)
+      );
+    }, FINALIZE_DELAY_MS)
+  );
+}
+
+/** إنشاء الطلب من الجلسة الحالية */
 function finalizeRequest(chatId) {
   const session = getSession(chatId);
-  const customer = store.getCustomer(chatId) || {};
   const found = findServiceById(session.serviceId);
   const service = found ? found.service : { name: 'خدمة', price: '-' };
 
-  // ربط الأسئلة بإجاباتها
-  const qa = (service.questions || []).map((q, i) => ({
-    question: q,
-    answer: session.answers[i] || '',
-  }));
-
   const request = store.createRequest({
     chatId,
-    customer: {
-      name: customer.name,
-      phone: customer.phone,
-      idNumber: customer.idNumber,
-      city: customer.city,
-    },
     sectionId: session.sectionId,
     serviceId: session.serviceId,
     serviceName: service.name,
     price: service.price,
-    answers: qa,
     documentsCount: session.documents.length,
     documents: session.documents,
   });
@@ -120,6 +121,18 @@ function finalizeRequest(chatId) {
   session.step = 'main_menu';
 
   return { request, service };
+}
+
+/** إغلاق الطلب وإرسال رسالة التأكيد للعميل وإشعار الموظف */
+async function finalizeAndConfirm(chatId) {
+  cancelFinalizeTimer(chatId);
+  const session = getSession(chatId);
+  if (session.step !== 'service_documents' || session.documents.length === 0) {
+    return;
+  }
+  const { request, service } = finalizeRequest(chatId);
+  await sendFn(chatId, messages.requestSubmitted(request.id, service.name));
+  await notifyFn(request);
 }
 
 /* ------------------------- المعالج الرئيسي ------------------------- */
@@ -135,56 +148,22 @@ function handleMessage(chatId, msg) {
 
   // أوامر عامة متاحة في أي وقت
   if (text === '0' || /^(القائمة|قائمة|رجوع|بداية)$/i.test(text)) {
+    cancelFinalizeTimer(chatId);
     resetFlow(chatId);
     session.step = 'main_menu';
     return [messages.backToMenu, buildMainMenu()];
   }
 
-  // وضع التحدث مع موظف: البوت صامت حتى يكتب العميل "بوت"
-  if (session.step === 'human') {
-    if (/^(بوت|bot)$/i.test(text)) {
-      session.step = 'main_menu';
-      return [buildMainMenu()];
-    }
-    return []; // لا يرد البوت، الموظف هو من يرد
-  }
-
   switch (session.step) {
     case 'start':
-      return handleStart(chatId);
-
-    case 'collect_name':
-      session.draft.name = msg.text.trim();
-      session.step = 'collect_phone';
-      return [messages.askPhone];
-
-    case 'collect_phone':
-      session.draft.phone = text;
-      session.step = 'collect_id';
-      return [messages.askId];
-
-    case 'collect_id':
-      if (!/^(تخطي|تخطى|skip)$/i.test(text)) {
-        session.draft.idNumber = text;
-      }
-      session.step = 'collect_city';
-      return [messages.askCity];
-
-    case 'collect_city':
-      session.draft.city = msg.text.trim();
-      store.saveCustomer(chatId, session.draft);
-      session.draft = {};
       session.step = 'main_menu';
-      return [messages.dataSaved, buildMainMenu()];
+      return [buildMainMenu()];
 
     case 'main_menu':
-      return handleMainMenu(chatId, text);
+      return handleMainMenu(chatId, text, msg);
 
     case 'section_menu':
       return handleSectionMenu(chatId, text);
-
-    case 'service_questions':
-      return handleServiceQuestions(chatId, msg);
 
     case 'service_documents':
       return handleServiceDocuments(chatId, msg);
@@ -193,30 +172,23 @@ function handleMessage(chatId, msg) {
       return handleTrack(chatId, text);
 
     default:
-      return handleStart(chatId);
+      session.step = 'main_menu';
+      return [buildMainMenu()];
   }
 }
 
-function handleStart(chatId) {
+function handleMainMenu(chatId, text, msg) {
   const session = getSession(chatId);
-  const customer = store.getCustomer(chatId);
 
-  if (customer && customer.name) {
-    // عميل معروف: نعرض القائمة مباشرة
-    session.step = 'main_menu';
-    return [
-      `أهلاً بعودتك ${customer.name} 👋`,
-      buildMainMenu(),
-    ];
+  // مستند وصل بعد اكتمال الطلب → يُضاف للطلب الأخير
+  if (msg && msg.hasMedia && msg.mediaSaved) {
+    const added = store.appendDocumentToLatest(
+      chatId,
+      { type: 'media', file: msg.mediaSaved },
+      LATE_DOCUMENT_WINDOW_MS
+    );
+    if (added) return [messages.lateDocumentAdded];
   }
-
-  // عميل جديد: نبدأ بجمع البيانات
-  session.step = 'collect_name';
-  return [buildMainMenu(), messages.askName];
-}
-
-function handleMainMenu(chatId, text) {
-  const session = getSession(chatId);
 
   switch (text) {
     case '1':
@@ -230,9 +202,6 @@ function handleMainMenu(chatId, text) {
     case '4':
       session.step = 'track';
       return [messages.trackAsk];
-    case '5':
-      session.step = 'human';
-      return [messages.humanHandoff];
     default:
       return [messages.invalidOption];
   }
@@ -248,22 +217,8 @@ function handleSectionMenu(chatId, text) {
   }
 
   const service = section.services[index - 1];
-  return startService(chatId, service, section);
-}
-
-function handleServiceQuestions(chatId, msg) {
-  const session = getSession(chatId);
-  const { service } = findServiceById(session.serviceId);
-
-  // حفظ إجابة السؤال الحالي
-  session.answers.push(msg.text.trim());
-  session.questionIndex += 1;
-
-  if (session.questionIndex < service.questions.length) {
-    return [`❓ ${service.questions[session.questionIndex]}`];
-  }
-
-  // انتهت الأسئلة → طلب المستندات
+  session.serviceId = service.id;
+  session.documents = [];
   session.step = 'service_documents';
   return [buildDocumentsMessage(service)];
 }
@@ -272,28 +227,31 @@ function handleServiceDocuments(chatId, msg) {
   const session = getSession(chatId);
   const text = normalize(msg.text);
 
-  // إنهاء وإرسال الطلب
-  if (/^(تم|انتهيت|ارسال|إرسال|done)$/i.test(text)) {
+  // "تم" تغلق الطلب فوراً دون انتظار المؤقت
+  if (/^(تم|انتهيت|ارسال|إرسال|خلصت|done)$/i.test(text)) {
     if (session.documents.length === 0) {
       return [
-        '⚠️ لم تُرسل أي مستند بعد. يرجى إرسال المستندات المطلوبة ثم اكتب *تم*.',
+        '⚠️ لم تُرسل أي مستند بعد. يرجى إرسال المستندات المطلوبة أولاً.',
       ];
     }
+    cancelFinalizeTimer(chatId);
     const { request, service } = finalizeRequest(chatId);
-    return [
-      messages.requestSubmitted(request.id, service.name),
-      buildMainMenu(),
-    ];
+    notifyFn(request).catch((err) =>
+      console.error('تعذّر إشعار الموظف:', err)
+    );
+    return [messages.requestSubmitted(request.id, service.name)];
   }
 
   // استقبال مستند (وسائط أو نص)
   if (msg.hasMedia && msg.mediaSaved) {
     session.documents.push({ type: 'media', file: msg.mediaSaved });
+    scheduleFinalize(chatId);
     return [messages.documentReceived];
   }
 
   if (msg.text && msg.text.trim()) {
     session.documents.push({ type: 'text', value: msg.text.trim() });
+    scheduleFinalize(chatId);
     return [messages.documentReceived];
   }
 
@@ -320,4 +278,9 @@ function handleTrack(chatId, text) {
   return [lines.join('\n')];
 }
 
-module.exports = { handleMessage, buildMainMenu };
+module.exports = {
+  handleMessage,
+  buildMainMenu,
+  registerSender,
+  registerNotifier,
+};

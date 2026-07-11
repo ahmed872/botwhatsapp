@@ -12,8 +12,7 @@ const path = require('path');
 const { Client, LocalAuth } = require('whatsapp-web.js');
 const qrcode = require('qrcode-terminal');
 
-const { handleMessage } = require('./bot/flow');
-const store = require('./data/store');
+const flow = require('./bot/flow');
 
 // رقم واتساب الموظف لاستقبال إشعارات الطلبات الجديدة (اختياري).
 // اضبطه في متغير البيئة EMPLOYEE_NUMBER بصيغة الدولة، مثال: 9665XXXXXXXX
@@ -80,25 +79,16 @@ async function saveMedia(message) {
  */
 async function notifyEmployee(request) {
   if (!EMPLOYEE_NUMBER) return;
-  const c = request.customer || {};
+  const clientNumber = (request.chatId || '').replace('@c.us', '');
   const lines = [
     '🔔 *طلب جديد*',
     '',
     `🔖 ${request.id}`,
     `📄 الخدمة: ${request.serviceName}`,
     `💰 السعر: ${typeof request.price === 'number' ? request.price + ' ريال' : request.price}`,
-    '',
-    '👤 بيانات العميل:',
-    `الاسم: ${c.name || '-'}`,
-    `الجوال: ${c.phone || '-'}`,
-    `الهوية/الإقامة: ${c.idNumber || '-'}`,
-    `المدينة: ${c.city || '-'}`,
-    `عدد المستندات المرفقة: ${request.documentsCount || 0}`,
+    `📱 رقم واتساب العميل: ${clientNumber}`,
+    `📎 عدد المستندات المرفقة: ${request.documentsCount || 0}`,
   ];
-  if (request.answers && request.answers.length) {
-    lines.push('', '📝 الإجابات:');
-    request.answers.forEach((qa) => lines.push(`- ${qa.question} ${qa.answer}`));
-  }
   try {
     const jid = `${EMPLOYEE_NUMBER}@c.us`;
     await client.sendMessage(jid, lines.join('\n'));
@@ -107,7 +97,10 @@ async function notifyEmployee(request) {
   }
 }
 
-// نتتبع عدد الطلبات قبل/بعد كل رسالة لاكتشاف الطلبات الجديدة وإشعار الموظف
+// قنوات يستخدمها محرك المحادثة للتأكيد التلقائي بعد آخر مستند
+flow.registerSender((chatId, text) => client.sendMessage(chatId, text));
+flow.registerNotifier(notifyEmployee);
+
 client.on('message', async (message) => {
   try {
     // تجاهل رسائل المجموعات ورسائل النظام
@@ -121,9 +114,7 @@ client.on('message', async (message) => {
       mediaSaved = await saveMedia(message);
     }
 
-    const before = store.getRequestsByChat(chatId).length;
-
-    const replies = handleMessage(chatId, {
+    const replies = flow.handleMessage(chatId, {
       text: message.body || '',
       hasMedia: message.hasMedia,
       mediaSaved,
@@ -133,13 +124,6 @@ client.on('message', async (message) => {
       if (reply && reply.trim()) {
         await client.sendMessage(chatId, reply);
       }
-    }
-
-    // إن زاد عدد الطلبات فهذا يعني إنشاء طلب جديد → إشعار الموظف
-    const after = store.getRequestsByChat(chatId);
-    if (after.length > before) {
-      const newest = after[after.length - 1];
-      await notifyEmployee(newest);
     }
   } catch (err) {
     console.error('خطأ أثناء معالجة الرسالة:', err);
