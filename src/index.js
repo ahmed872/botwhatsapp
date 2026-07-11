@@ -55,8 +55,28 @@ client.on('auth_failure', (msg) => {
   console.error('❌ فشل التوثيق:', msg);
 });
 
-client.on('disconnected', (reason) => {
+client.on('disconnected', async (reason) => {
   console.warn('⚠️ تم قطع الاتصال:', reason);
+  if (reason === 'LOGOUT') {
+    console.warn(
+      'تم تسجيل خروج الجلسة من واتساب. سيُعاد التشغيل وقد يظهر كود QR جديد لمسحه.'
+    );
+  }
+  console.log('🔄 إعادة الاتصال خلال 10 ثوانٍ...');
+  try {
+    await client.destroy();
+  } catch (_) {
+    /* المتصفح قد يكون مغلقاً بالفعل */
+  }
+  setTimeout(() => startWithRetry(), 10000);
+});
+
+// أخطاء داخلية في مكتبة واتساب (أثناء إعادة تحميل الصفحة مثلاً) يجب ألا تُسقط البوت
+process.on('unhandledRejection', (err) => {
+  console.error('⚠️ خطأ غير معالج (تم تجاوزه):', err && err.message ? err.message : err);
+});
+process.on('uncaughtException', (err) => {
+  console.error('⚠️ خطأ غير متوقع (تم تجاوزه):', err && err.message ? err.message : err);
 });
 
 /**
